@@ -34,15 +34,51 @@ jobs:
         with:
           prefix-key: dapper-e2e
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
+      # NOTE: we deliberately do NOT use actions/setup-python. It exports
+      # LD_LIBRARY_PATH=<toolcache>/lib, which makes lldb-dap load the wrong
+      # libpython and crash mid debug session (adapter exits -> tests time out).
+      # uv provides its own Python, so setup-python is redundant anyway.
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: '3.12'
 
-      - name: Run e2e suite (none, fake, debugpy)
+      # LLDB profile (Linux only, mirroring upstream's `--cxx /usr/bin/c++`).
+      # The runner's default lldb (19) lacks the DAP readMemory request (added in
+      # LLVM 20), so install a newer lldb-dap. C++ compiler is the runner's stock
+      # /usr/bin/c++. Setting DAPPER_TEST_LLDB_DAP makes run.py require lldb (fail,
+      # not skip). macOS has no lldb-dap here, so it runs none/fake/debugpy only.
+      - name: Install lldb-dap (Linux)
+        if: runner.os == 'Linux'
         run: |
-          uv run --project tests/profiles/debugpy --frozen \
-            python tests/run.py --require-profile debugpy
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22
+          sudo apt-get install -y lldb-22
+          echo "LD_LIBRARY_PATH is now: [$LD_LIBRARY_PATH]"
+          echo "DAPPER_TEST_LLDB_DAP=/usr/bin/lldb-dap-22" >> "$GITHUB_ENV"
+          echo "DAPPER_TEST_CXX=/usr/bin/c++" >> "$GITHUB_ENV"
+
+      # DIAGNOSTIC: drive lldb-dap-22 directly (no cargo/run.py) and capture its
+      # raw stdout+stderr during initialize->launch->configurationDone, to see why
+      # it never emits the 'initialized' event.
+      - name: Probe lldb-dap-22 handshake (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          /usr/bin/c++ -std=c++17 -g -O0 tests/fixtures/cpp_example.cpp -o /tmp/cpp_example
+          echo "=== lldb-dap-22 --version ==="; /usr/bin/lldb-dap-22 --version 2>&1 | head -2
+          cat > /tmp/probe.py <<'PYEOF'
+          import subprocess, sys, time
+          p = subprocess.Popen(["/usr/bin/lldb-dap-22"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+          i = b'{"seq":1,"type":"request","command":"initialize","arguments":{"adapterID":"probe","pathFormat":"path"}}'
+          l = b'{"seq":2,"type":"request","command":"launch","arguments":{"program":"/tmp/cpp_example","stopOnEntry":false,"initCommands":["breakpoint set --name sum_values"]}}'
+          c = b'{"seq":3,"type":"request","command":"configurationDone"}'
+          p.stdin.write(b"Content-Length: %d\r\n\r\n%s" % (len(i), i)); p.stdin.flush(); time.sleep(0.5)
+          p.stdin.write(b"Content-Length: %d\r\n\r\n%s" % (len(l), l)); p.stdin.flush(); time.sleep(0.5)
+          p.stdin.write(b"Content-Length: %d\r\n\r\n%s" % (len(c), c)); p.stdin.flush(); time.sleep(5)
+          p.terminate()
+          out, err = p.communicate(timeout=10)
+          sys.stdout.write("EXIT=%s\n" % p.returncode)
+          sys.stdout.write("STDOUT (%d bytes):\n%s\n" % (len(out), out.decode("utf-8", "replace")[:3000]))
+          sys.stdout.write("STDERR (%d bytes):\n%s\n" % (len(err), err.decode("utf-8", "replace")[:3000]))
+          PYEOF
+          python3 /tmp/probe.py
